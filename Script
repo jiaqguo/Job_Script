@@ -1,0 +1,1290 @@
+### codes are not complete, they cannot be directly used ###
+
+---- codes for 16S analysis QIIME2 part -------
+# qiime version: qiime2-amplicon-2025.4
+# compare relative susceptibility of Fayoumi M5.1, AIL and Cobb chickens to NE and EM
+# exp. date: Room 109; 9/21/25 – 10/8/25
+
+
+# extract data
+for folder in */; do
+    cd $folder
+    mv *raw* /scratch/josh/16s_neem/rawdata/result_X202SC24080382-Z01-F003/data
+    cd ..
+done
+
+
+# qiime2 part -------------------------------
+#generate manifest file
+wd="/scratch/josh/16s_neem/rawdata/"
+echo -e "sample-id\tforward-absolute-filepath\treverse-absolute-filepath" > temp.txt
+for r1 in *_1*;
+do
+  id="${r1/.raw_1.fastq.gz/}"  
+  r2="${r1/_1/_2}"
+  echo -e "${id}\t${wd}${r1}\t${wd}${r2}" >> temp.txt
+done
+awk -F "\t" 'BEGIN {OFS="\t"} {gsub("_",".",$1); print}' temp.txt > manifest.txt && rm temp.txt
+
+
+
+# code for analysis----------------------------
+
+#!/bin/bash
+#SBATCH -p batch
+#SBATCH --job-name="qiime"
+#SBATCH -t 20:00:00
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=10
+#SBATCH --mail-user=jiaqing.guo@okstate.edu
+#SBATCH --mail-type=end
+
+source /scratch/josh/software/miniconda3/bin/activate   #activate conda
+conda activate qiime2-amplicon-2025.4
+
+results=/scratch/josh/16s_neem/results/
+raw_dir=/scratch/josh/16s_neem/rawdata/
+classifier=/scratch/josh/classifier/rdp_classifier.qza
+cd $results
+
+####import data
+qiime tools import \
+  --type 'SampleData[PairedEndSequencesWithQuality]' \
+  --input-path ${raw_dir}manifest.txt \
+  --output-path demux.qza \
+  --input-format PairedEndFastqManifestPhred33V2
+
+qiime cutadapt trim-paired \
+    --i-demultiplexed-sequences demux.qza \
+    --p-cores 10 \
+    --p-overlap 3 \
+    --p-front-f CCTAYGGGRBGCASCAG \
+    --p-front-r GGACTACNNGGGTATCTAAT \
+    --p-no-indels \
+    --p-discard-untrimmed \
+    --o-trimmed-sequences trimmed.qza 
+#--p-overlap   [defult 3]
+#--p-indels / --p-no-indels  [defult True]
+#---p-discard-untrimmed / --p-no-discard-untrimmed [defult False]
+
+#visualization 
+qiime demux summarize \
+    --i-data demux.qza \
+    --o-visualization demux.qzv
+qiime demux summarize \
+    --i-data trimmed.qza \
+    --o-visualization trimmed.qzv
+
+####join the sequences
+time qiime vsearch merge-pairs \
+    --i-demultiplexed-seqs  trimmed.qza \
+    --o-merged-sequences  joined.qza \
+    --o-unmerged-sequences un_joined.qza \
+    --p-minovlen 10 \
+    --p-maxdiffs 10 \
+    --p-threads 10
+#--p-minovlen [defult 10]
+#--p-maxdiffs [defult 10] 
+#--p-threads [defult 10]
+
+####qualify the sequences
+time qiime quality-filter q-score \
+    --i-demux joined.qza  \
+    --p-min-quality 30 \
+    --p-quality-window 5 \
+    --p-min-length-fraction 1 \
+    --o-filtered-sequences joined-filtered.qza \
+    --o-filter-stats joined-filtered-stats.qza
+#--p-quality-window [default 3]
+#--p-min-length-fraction [default 0.75]
+
+#visualization
+qiime demux summarize \
+    --i-data joined.qza \
+    --o-visualization joined.qzv
+qiime demux summarize \
+    --i-data joined-filtered.qza \
+    --o-visualization joined-filtered.qzv
+qiime metadata tabulate \
+    --m-input-file joined-filtered-stats.qza \
+    --o-visualization  joined-filtered-stats.qzv
+
+####denoise
+time qiime deblur denoise-16S \
+    --i-demultiplexed-seqs joined-filtered.qza \
+    --p-trim-length 402 \
+    --p-sample-stats  \
+    --p-jobs-to-start 10 \
+    --p-min-reads 10 \
+    --p-min-size 1 \
+    --o-table feature-table.qza \
+    --o-representative-sequences rep-seqs.qza \
+    --o-stats stats-deblur.qza 
+#--p-min-reads [defult 10]
+#--p-min-size [defult 2]
+
+#visualization
+qiime feature-table tabulate-seqs \
+    --i-data rep-seqs.qza \
+    --o-visualization rep-seqs.qzv
+qiime deblur visualize-stats \
+  --i-deblur-stats stats-deblur.qza \
+  --o-visualization stats-deblur.qzv
+qiime feature-table summarize \
+    --i-table feature-table.qza \
+    --o-visualization feature-table.qzv 
+
+###build the phylogenic tree
+time qiime phylogeny align-to-tree-mafft-fasttree \
+    --i-sequences rep-seqs.qza \
+    --o-alignment seqs-aligned.qza \
+    --o-masked-alignment rep-seqs_masked.qza \
+    --o-tree unrooted-tree.qza \
+    --o-rooted-tree rooted-tree.qza \
+    --p-n-threads auto
+
+###taxonomic annotation
+qiime feature-classifier classify-sklearn \
+    --i-reads rep-seqs.qza \
+    --i-classifier $classifier \
+    --o-classification tax.qza
+
+#data export
+qiime tools export \
+    --input-path feature-table.qza\
+    --output-path ./
+biom convert \
+    -i feature-table.biom \
+    -o feature_table.tsv \
+    --to-tsv
+qiime tools export \
+    --input-path rep-seqs.qza \
+    --output-path ./
+qiime tools export \
+    --input-path rooted-tree.qza \
+    --output-path ./rooted_tree.nwk
+qiime tools export \
+    --input-path tax.qza \
+    --output-path ./
+
+
+
+---- codes for R part (statistical analysis and visualization) ------------
+setwd("D:/OneDrive - Oklahoma A and M System/PhD/Animal trial/2025.9.21_IT_(data)/16s2")
+
+# modify tsv file as csv file -----------
+library(tidyverse)
+# for feature table
+feature_table <- read.table("qiime_file/feature_table.tsv",row.names = 1,sep = "\t",comment.char = "$",skip = 1)
+colnames(feature_table) <- feature_table[1,]
+feature_table <- feature_table[-1,]
+
+# for tax table
+tax <- read.table("qiime_file/taxonomy.tsv",row.names = 1,header = T,sep = "\t") %>% 
+  separate(Taxon,into = c("Domain","Phylum","Class","Order","Family","Genus","Species"),sep = ";")
+tax[is.na(tax)] <- ""
+
+
+ileum_sample <- sample_data %>% 
+  filter(Segment == 'Ileum') %>% 
+  column_to_rownames()
+
+cecum_sample <- sample_data %>% 
+  filter(Segment == 'Cecum') %>% 
+  column_to_rownames()
+
+
+# Diversity------------
+setwd("D:/OneDrive - Oklahoma A and M System/PhD/Animal trial/2025.9.21_IT_(data)/16s2/cecum")
+f_table <- "feature_table.csv"
+s_table <- "sample_data.csv"
+t_table <- "taxonomy.csv"
+
+library(tidyverse)
+library(phyloseq)
+library(vegan)
+library(ape)
+feature_table <- read.csv(f_table,header = T,row.names = 1)
+taxonomy <- read.csv(t_table,header = T,row.names = 1)
+sample_data <- read.csv(s_table,header = T,row.names = 1) 
+
+# Transform feature table and taxonomy table to matrix
+OTU<- otu_table(as.matrix(feature_table),taxa_are_rows = T)
+TAX<- tax_table(as.matrix(taxonomy))
+SAM<-sample_data(sample_data)
+TREE<-read_tree('tree.nwk')
+TREE <- multi2di(TREE)
+physeq<- phyloseq(OTU,TAX,SAM,TREE)
+# rarefy data
+# rarecurve(t(feature_table), step=200,lty = 2)
+min(colSums(feature_table))
+physeq<-rarefy_even_depth(physeq,replace = F,rngseed = T)
+otu_rarefy <- as.data.frame(otu_table(physeq))
+write.csv(otu_rarefy,file = "feature_table_rarefy.csv")
+## α-diversity-----
+# plot_richness(phy_3,x="treatment",measures = c('Observed','Shannon'))
+dir.create("a_diversity")
+
+a_diversity <- estimate_richness(physeq,measures = c('Observed','Shannon'))
+pielou <- a_diversity$Shannon / log(a_diversity$Observed)
+a_diversity <- cbind(a_diversity,pielou)
+write.csv(a_diversity,file = "a_diversity/a_diversity.csv")
+
+## β-diversity----
+library(tidyverse)
+unlist(distanceMethodList)  #check the methods to calculate distance matrix
+dir.create("b-diversity")
+# PCoA analysis  
+# define function
+b_diversity_pcoa <- function(input, output){
+  unifrac_ord <- ordinate(input, method = 'PCoA',distance = 'unifrac')
+  wunifrac_ord <- ordinate(input, method = 'PCoA',distance = 'wunifrac')
+
+  #Export distance matrix, coordinates and explained variance of principal components
+  unifrac_info <- as.data.frame(cbind(rownames(unifrac_ord$vectors),
+                                      unifrac_ord$vectors[,1],
+                                      unifrac_ord$vectors[,2],
+                                      unifrac_ord$values[,2]))
+  colnames(unifrac_info) <- c("SampleID","axis1","axis2","explanation")
+  sample_data$SampleID <- rownames(sample_data)
+  unifrac_info <- left_join(unifrac_info,sample_data,by="SampleID")
+  
+  wunifrac_info <- cbind(as.data.frame(rownames(wunifrac_ord$vectors)),
+                         as.data.frame(wunifrac_ord$vectors)$Axis.1,
+                         as.data.frame(wunifrac_ord$vectors)$Axis.2,
+                         as.data.frame(wunifrac_ord$values)$Relative_eig)
+  colnames(wunifrac_info) <- c("SampleID","axis1","axis2","explanation")
+  wunifrac_info <- left_join(wunifrac_info,sample_data,by="SampleID")
+  
+  write.csv(unifrac_info,file = paste0("b-diversity/unifrac_pcoa_",output,".csv"))
+  write.csv(wunifrac_info,file = paste0("b-diversity/wunifrac_pcoa_",output,".csv"))
+}
+
+
+# Taxonomy composition----------
+library(tidyverse)
+dir.create("composition")
+f_table <- "feature_table_relative.csv"
+s_table <- "sample_data.csv"
+t_table <- "taxonomy.csv"
+otu <-read.csv(f_table,header = T,row.names = 1)
+sample_data <-read.csv(s_table,header = T,row.names = 1)
+tax <- read.csv(t_table,header = T,row.names = 1)
+otu$rownames <- rownames(otu)
+tax$rownames <- rownames(tax)
+
+#TOP Phylum
+phylum_otu <- merge(tax, otu, by='rownames')
+rownames(phylum_otu) <- phylum_otu$rownames
+phylum_otu <- phylum_otu[,c(-1,-2,-4,-5,-6,-7,-8)]
+phylum_otu <- aggregate(phylum_otu[,-1], by=list(phylum_otu$Phylum), FUN='sum')
+rownames(phylum_otu) <- phylum_otu$Group.1
+phylum_otu <- phylum_otu[,-1]
+phylum_otu <- phylum_otu[order(rowSums(phylum_otu),decreasing = T),]
+write.csv(phylum_otu,file = 'composition/phylum.csv')
+
+
+#Top 10 Family
+number=10
+family_otu <- merge(tax, otu, by='rownames')
+rownames(family_otu) <- family_otu$rownames
+family_otu <- family_otu[,c(-1,-2,-3,-4,-5,-7,-8)]
+family_otu <- aggregate(family_otu[,-1], by=list(family_otu$Family), FUN='sum')
+rownames(family_otu) <- family_otu$Group.1
+family_otu <- family_otu[,-1]
+family_otu <- family_otu[order(rowSums(family_otu),decreasing = T),]
+family_otu <- family_otu[c(1:number),]   # top 10
+family_otu <- rbind(family_otu, 1 - colSums(family_otu))
+rownames(family_otu)[number+1] <- 'Others'  # 10 + 1 is others
+write.csv(family_otu,file = 'composition/family_top10.csv')
+
+
+#Top 20 Genus
+number=20
+genus_otu <- merge(tax, otu, by='rownames')
+rownames(genus_otu) <- genus_otu$rownames
+genus_otu <- genus_otu[,c(-1,-2,-3,-4,-5,-6,-8)]
+genus_otu <- aggregate(genus_otu[,-1], by=list(genus_otu$Genus), FUN='sum')
+rownames(genus_otu) <- genus_otu$Group.1
+genus_otu <- genus_otu[,-1]
+genus_otu <- genus_otu[order(rowSums(genus_otu),decreasing = T),]
+genus_otu <- genus_otu[c(1:number),]
+genus_otu <- rbind(genus_otu, 1 - colSums(genus_otu))
+rownames(genus_otu)[number+1] <- 'Others'
+write.csv(genus_otu,file = 'composition/genus_top20.csv')
+
+
+#TOP number (25/30) ASV
+number=25
+feature_otu <- merge(tax, otu, by='rownames')
+rownames(feature_otu) <-feature_otu$Species
+feature_otu <- feature_otu[,-c(1:8)]
+feature_otu <- feature_otu[order(rowSums(feature_otu),decreasing = T),]
+feature_otu <- feature_otu[1:number,]
+feature_otu <- rbind(feature_otu, 1 - colSums(feature_otu))
+rownames(feature_otu)[number+1] <- "Others"
+write.csv(feature_otu,file = 'composition/feature_top25.csv')
+
+
+# Visualization--------
+setwd("D:/OneDrive - Oklahoma A and M System/PhD/Animal trial/2025.9.21_IT_(data)/16s2/cecum")
+
+library(tidyverse)
+library(car)
+library(rstatix)
+# a-diversity --------
+
+read_file_function <- function(index,data,sample_data,group_var){
+  a_diversity <- read.csv(data,header = T,row.names = 1)
+  sample_data <- read.csv(sample_data,header = T,row.names = 1)
+  a_diversity$SampleID <- rownames(a_diversity)
+  sample_data$SampleID <- rownames(sample_data)
+  a_pic <- merge(a_diversity,sample_data,by='SampleID')
+  print(table(a_pic[[group_var]]))    #check the different treatments of group
+  a_pic[[group_var]] <- as.factor(a_pic[[group_var]])
+  df <- a_pic[,c(index, group_var)]
+  return(df)
+}
+
+
+# Normality test and Homogeneity of variance test
+check_function <- function(index,group_var,data){
+  # construct the formula from the column name strings
+  formula_str <- paste(index, "~", group_var)
+  formula_obj <- as.formula(formula_str)
+  # Fit the ANOVA model using the constructed formula
+  fit <- aov(formula_obj, data = data)
+  res <- residuals(fit)
+  # Get the vectors needed for plotting (safe extraction using [[ operator]])
+  group_data <- data[[group_var]]
+  par(mfrow=c(1,2))
+  # Normality Check
+  qqnorm(res, main = "Normal Q-Q Plot of Residuals"); 
+  qqline(res)
+  cat("\nNormality test (Shapiro-Wilk):\n")
+  print(shapiro.test(res))
+  # Homogeneity of Variance Check (Residuals vs. Fitted/Group)
+  cat("\nResiduals vs. Group Plot (Homogeneity):\n")
+  plot(group_data, res, 
+       xlab = group_var, 
+       ylab = "Residuals",
+       main = "Residuals vs. Group")
+  abline(h=0, col="red")
+  cat("\nHomogeneity of variance test (Levene's Test):\n")
+  # Use the constructed formula with leveneTest
+  print(leveneTest(formula_obj, data = data))
+  par(mfrow=c(1,1))
+}
+
+kw_function <- function(formula, data){
+  kw_test <- kruskal.test(formula,data = data)
+  print(kw_test)
+  posthoc <- dunn_test(data = data,formula,p.adjust.method = "fdr")
+  posthoc$compar <- paste(posthoc$group1,"-",posthoc$group2,sep="")
+  print(posthoc)
+  return(posthoc)
+}
+
+aov_function <- function(formula, data){
+  aov <- aov(formula,data = data)
+  print(summary(aov))
+  posthoc <- as.data.frame(TukeyHSD(aov)[[1]])
+  posthoc$compar <- rownames(posthoc)
+  colnames(posthoc)[colnames(posthoc) == "p adj"] <- "p.adj"
+  posthoc<-separate(data = posthoc,col = compar,into = c("group1", "group2"),sep = "-")
+  posthoc$compar <- paste(posthoc$group2,"-",posthoc$group1,sep = "")
+  print(posthoc)
+  return(posthoc)
+}
+
+
+
+
+
+## statiscal analysis -------------
+# "Observed"  "Shannon"   "pielou"
+index <- "Shannon"
+data <- "a_diversity/a_diversity.csv"
+sample_data <- "sample_data.csv"
+group_var <- 'Group'
+# read data
+df <- read_file_function(index,data,sample_data,group_var)
+df$Group <- factor(df$Group,levels = c('Cobb_Mock', 'Cobb_EM', 'Cobb_NE',
+                                       'AIL_Mock', 'AIL_EM', 'AIL_NE',
+                                       'M5.1_Mock', 'M5.1_EM', 'M5.1_NE'))
+# analysis
+check_function(index,group_var,df)
+
+
+# statistical analysis
+# 2 treatments
+# t_results <- t.test(Observed~treatment, data = df)
+# w_results <- wilcox.test(Observed ~treatment, data = df)
+# gather results
+# stat_results <- as.data.frame(matrix(ncol = 3,nrow = 15))
+# colnames(stat_results) <- c("index","dpi","p.value")
+# stat_results$index[1] <- index
+# stat_results$dpi[1] <- unique(df$day)
+# stat_results$p.value[1] <- w_results$p.value
+
+
+# more than 2 treatments
+formula_obj <- as.formula(paste(index, "~", group_var))
+posthoc <- kw_function(formula_obj, data=df)
+posthoc <- aov_function(formula_obj, data=df)
+# get the compact letter display for lists of comparisons
+library(rcompanion)
+max <- df %>% 
+  group_by(Group) %>% 
+  summarise(
+    max = max(.data[[index]], na.rm = TRUE) + 
+              (max(.data[[index]], na.rm = TRUE) * 0.01)
+  )
+names(max)[1] <- "Group"
+sig_mark <- cldList(p.adj ~ compar, data = posthoc) %>% 
+  left_join(.,max, by = "Group") %>% 
+  mutate(source = index)
+sig_mark
+
+sig_mark_observed <- sig_mark
+sig_mark_shannon <- sig_mark
+
+
+sig_mark <- rbind(sig_mark_observed,sig_mark_shannon)
+write.csv(sig_mark,'a_diversity/sig_mark.csv')
+
+
+## fig ------------------
+# Shannon
+p1 <- ggplot(a_pic,aes(x = Group,y = Shannon))+
+  geom_boxplot(aes(fill=Group,color=Group),width=0.6)+
+  geom_jitter(aes(color = Group),width = 0.2,size = 1) +
+  labs(x="",y="",title = "Shannon Index")+
+  scale_fill_manual(values = my_color_fill)+
+  scale_color_manual(values = my_color_color)+
+  #scale_y_continuous(limits = c(0.3,4.2),breaks = seq(1, 4, by = 1))+
+  scale_y_continuous(limits = c(0.1,2.8),breaks = seq(0.5, 2.5, by = 0.5))+
+  theme_bw()+
+  theme(legend.position = "none",
+        panel.grid.minor = element_blank(),
+        axis.text.x = element_text(size = 8,vjust = 0.5,hjust = 0.5,
+                                   color = "black",angle = 0,
+                                   margin = margin(t = 3)),
+        axis.text.y = element_text(size = 8,color = "black"),
+        panel.border = element_rect(linewidth = 0.5,color = 'black'),
+        #axis.ticks.x = element_blank(), 
+        axis.ticks.x = element_line(linewidth = 0.3), 
+        axis.ticks.y = element_line(linewidth  = 0.3),
+        plot.title = element_text(hjust = 0.5,size=9,margin = margin(b = 3)),
+        strip.text = element_text(size = 8, color = "black"), #adjust facet_grid text
+        panel.spacing.x= unit(0.1, "lines") #adjust facet_grid horizontal distance
+  ) +
+  geom_text(
+    data = p_data[p_data$source == 'Shannon',],
+    aes(x = Group, y = max, label = Letter), 
+    size = 4, 
+    inherit.aes = FALSE, 
+    parse = TRUE 
+  ) +
+  geom_vline(xintercept=c(3.5,6.5), linetype = "dashed", linewidth = 0.3)
+p1
+
+library(ggh4x)
+p1 <- p1 + force_panelsizes(total_width=unit(3, "in"),total_height=unit(1.4, "in"))
+p1 
+ggsave("a_diversity/shannon2.pdf",p1,width = 3.3*1.2,height = 1.5*2)
+
+# β diversity------------
+#library(ggh4x)   #stat_centroid
+#library(ggalt)  #geom_encircle
+#library(ggpubr)  #link the points
+setwd("D:/OneDrive - Oklahoma A and M System/PhD/Animal trial/2025.9.21_IT_(data)/16s2/cecum")
+library(tidyverse)
+library(ggtext)
+##Weighted----------------------------
+mock <- read.csv('b-diversity/wunifrac_pcoa_mock.csv',row.names = 1,header = T) %>% 
+  mutate(group_var = 'Mock')
+em <- read.csv('b-diversity/wunifrac_pcoa_em.csv',row.names = 1,header = T) %>% 
+  mutate(group_var = 'EM')
+ne <- read.csv('b-diversity/wunifrac_pcoa_ne.csv',row.names = 1,header = T) %>% 
+  mutate(group_var = 'NE')
+
+wunifrac <- rbind(mock, em, ne)
+
+# annotation information 
+# ileum
+annotation_data <- data.frame(
+  x = c(-0.05,-0.05,-0.05),
+  y = c(-0.2,-0.2,-0.2),
+  group_var = c('Mock','EM','NE'),
+  label = c(
+    "<i>P</i> < 0.001<br>R<sup>2</sup> = 0.400",
+    "<i>P</i> = 0.058<br>R<sup>2</sup> = 0.101",
+    "<i>P</i> < 0.001<br>R<sup>2</sup> = 0.721"
+  )
+)
+
+library(ggh4x)
+p1 <- p1 + force_panelsizes(total_width=unit(3, "in"),total_height=unit(1.3, "in"))
+p1 
+ggsave("b-diversity/wunifrac2.pdf",p1,width = 3.3*1.2,height = 1.5*2)
+ggsave("b-diversity/wunifrac2.png",p1,width = 3.3*1.2,height = 1.5*2)
+
+##Unweighted--------------------------
+mock <- read.csv('b-diversity/unifrac_pcoa_mock.csv',row.names = 1,header = T) %>% 
+  mutate(group_var = 'Mock')
+em <- read.csv('b-diversity/unifrac_pcoa_em.csv',row.names = 1,header = T) %>% 
+  mutate(group_var = 'EM')
+ne <- read.csv('b-diversity/unifrac_pcoa_ne.csv',row.names = 1,header = T) %>% 
+  mutate(group_var = 'NE')
+
+unifrac <- rbind(mock, em, ne)
+
+
+# annotation information 
+# ileum
+annotation_data <- data.frame(
+  x = c(-0.05,-0.05,-0.05),
+  y = c(-0.2,-0.2,-0.2),
+  group_var = c('Mock','EM','NE'),
+  label = c(
+    "<i>P</i> < 0.001<br>R<sup>2</sup> = 0.165",
+    "<i>P</i> < 0.001<br>R<sup>2</sup> = 0.183",
+    "<i>P</i> < 0.001<br>R<sup>2</sup> = 0.209"
+  )
+)
+
+# cecum
+annotation_data <- data.frame(
+  x = c(-0.05,-0.05,-0.05),
+  y = c(-0.2,-0.2,-0.2),
+  group_var = c('Mock','EM','NE'),
+  label = c(
+    "<i>P</i> < 0.001<br>R<sup>2</sup> = 0.582",
+    "<i>P</i> < 0.001<br>R<sup>2</sup> = 0.554",
+    "<i>P</i> < 0.001<br>R<sup>2</sup> = 0.352"
+  )
+)
+
+# re-factor 
+rm(list = setdiff(ls(),c('unifrac','annotation_data')))
+unifrac$group_var <- factor(unifrac$group_var, levels = c('Mock','EM','NE'))
+unifrac$Breeds <- factor(unifrac$Breeds, levels = c('Cobb','AIL','M5.1'))
+annotation_data$group_var <- factor(annotation_data$group_var, levels = c('Mock','EM','NE'))
+
+# define color
+my_color_color <- c(Cobb="#567C66", AIL="#F2BD6E", M5.1='#D63539')
+my_color_fill <- c(Cobb="#89C7A3", AIL="#F2E1C7", M5.1='#E08082')
+
+
+# plot    ileum: 'PCoA1 (18.38%)' 'PCoA2 (17.46%)'   cecum: 'PCoA1 (54.56%)' 'PCoA2 (12.43%)
+p1 <- ggplot(unifrac,aes(x=axis1,axis2,color=Breeds)) +
+  facet_grid(.~group_var)+
+  geom_point(size=2) + 
+  scale_color_manual(values = my_color_color)+
+  #scale_fill_manual(values = my_color_color)+
+  labs(x='PCoA1 (18.38%)',y='PCoA2 (17.46%)',color="",title = "Unweighted UniFrac")+
+  scale_x_continuous(breaks = c(-0.25,0,0.25))+
+  #scale_y_continuous(breaks = c(-0.25,0,0.25))+
+  #stat_ellipse(level=0.8, show.legend = FALSE)+
+  theme_bw()+
+  theme(
+        axis.text.x = element_text(size = 8,vjust = 0.9,color = "black",margin = margin(t=0.5)),
+        axis.text.y = element_text(size = 8,color = "black"),
+        panel.border = element_rect(linewidth = 0.5,color = 'black'),
+        axis.ticks.x = element_line(linewidth = 0.3), 
+        axis.ticks.y = element_line(linewidth  = 0.3),
+        legend.text = element_text(size = 9,colour = "black",margin = margin(l=-1)),
+        legend.spacing.x = unit(0.05, "cm"),
+        legend.margin = margin(l=-10),
+        #legend.position = c(1.1, 0.6),         
+        #legend.justification = c("right"), 
+        #plot.margin = unit(c(0, 20, 0, 0), "mm"), # top right bottom left
+        plot.title = element_text(hjust = 0.5,size = 9,margin = margin(b=3)),
+        axis.title = element_text(size=8),
+        strip.text = element_text(size = 9, color = "black"), #adjust facet_grid text
+        panel.spacing.x= unit(0.1, "lines") #adjust facet_grid horizontal distance
+        )+
+  geom_richtext(data = annotation_data,
+            aes(x = x, y = y, label = label),
+            size = 3, inherit.aes = FALSE,fill = NA,label.colour = NA)
+p1
+
+###  Feature  -----------------------------
+feature <- read.csv('composition/feature_top25.csv',header = T,row.names = 1)
+#re-order the feature name
+feature$name <- rownames(feature)
+feature <- separate(feature,name,into = c("species","order_num"),sep = "_F")
+feature <- feature[order(as.numeric(feature$order_num)),]
+feature <- feature[,-c(ncol(feature)-1,ncol(feature))]
+
+#modify data format
+fea_name <- rownames(feature)  #using for setting order
+feature <- as.data.frame(t(feature))
+feature$rownames <- rownames(feature)
+fea_pic <- merge(feature, sample_data, by='rownames')
+fea_pic <- pivot_longer(fea_pic,cols = colnames(feature)[-ncol(feature)],
+                        names_to = 'name',values_to = 'abundance')
+
+fea_pic <- fea_pic %>%
+  group_by(Breeds,Treatment,name) %>%
+  summarise(mean=mean(abundance),.groups = 'drop')
+
+
+### Make legend name ###
+# get the name
+name <- as.data.frame(t(as.data.frame(strsplit(fea_pic$name,"_F"))))
+for (i in 1:nrow(name)){
+  if (name$V1[i] == name$V2[i]) {
+    name$V2[i] = ""
+  }
+}
+# split strings according different situations
+name$V3 <- NA
+name$V4 <- NA
+for (i in 1:nrow(name)){
+  if (grepl("Unclassified", name$V1[i])){
+    name$V3[i] <- str_split_1(name$V1[i],"_U")[1]
+    name$V4[i] <- str_split_1(name$V1[i],"_U")[2]
+  }
+}
+# make font name
+name <- name %>%
+  mutate(
+    font_name = case_when(
+      V4 == "nclassified" ~ glue("<i>{V3}</i>_U{V4}_F{V2}"),
+      TRUE ~ glue("<i>{V1}</i>_F{V2}")
+    )
+  )
+
+fea_pic$font_name <- name$font_name
+fea_pic$font_name <- gsub("<i>Others</i>_F","Others",fea_pic$font_name)
+
+### Over ###
+
+fea_pic$Treatment <- factor(fea_pic$Treatment,levels = c("Mock","EM","NE"))
+fea_pic$Breeds <- factor(fea_pic$Breeds,levels = c('Cobb','AIL','M5.1'))
+fea_pic$name <- factor(fea_pic$name,levels = rev(fea_name))
+fea_pic <- fea_pic[order(fea_pic$name),]
+fea_col <- c(my_color[1:(length(unique(fea_pic$name))-1)],'gray')
+fea_pic$mean <- fea_pic$mean*100
+
+
+# modify color
+
+# Differential enrichment analysis-----------
+setwd("D:/OneDrive - Oklahoma A and M System/PhD/Animal trial/2025.9.21_IT_(data)/16s2/ileum")
+
+library(phyloseq)
+library(ANCOMBC)
+library(tidyverse)
+dir.create("deg")
+f_table <- "feature_table.csv"
+s_table <- "sample_data.csv"
+t_table <- "taxonomy.csv"
+feature_table <- read.csv(f_table,header = T,row.names = 1)
+taxonomy <- read.csv(t_table,header = T,row.names = 1)
+sample_data <- read.csv(s_table,header = T,row.names = 1)
+#Transform feature table and taxonomy table to matrix
+sample_data$Group <- factor(sample_data$Group,levels = c('Cobb_Mock', 'Cobb_EM', 'Cobb_NE',
+                                       'AIL_Mock', 'AIL_EM', 'AIL_NE',
+                                       'M5.1_Mock', 'M5.1_EM', 'M5.1_NE'))
+
+
+OTU<- otu_table(as.matrix(feature_table),taxa_are_rows = T)
+TAX<- tax_table(as.matrix(taxonomy))
+SAM<-sample_data(sample_data)
+physeq<- phyloseq(OTU,TAX,SAM)
+
+
+## For ASVs--------------------
+set.seed(123)
+output <- ancombc2(data=physeq,
+                  fix_formula = "Group",group = "Group",tax_level="Species",
+                  prv_cut = 0,lib_cut = 0, alpha=0.05,p_adj_method="fdr",
+                  struc_zero = F,neg_lb = F,pseudo = 1,pseudo_sens = FALSE,
+                  global = FALSE,pairwise = TRUE,dunnet = FALSE,trend = FALSE,
+                  n_cl = 1
+)
+# export results
+# select top ASVs
+feature_table2 <- feature_table %>% 
+  mutate(across(everything(), ~./sum(.))) %>% 
+  arrange(desc(rowSums(.))) 
+feature_table2 <- feature_table2[1:50,]
+# get results
+res_prim = output$res_pair %>% 
+  select(taxon, starts_with("lfc_"), starts_with("q_")) %>% 
+  filter(taxon %in% rownames(feature_table2)) 
+
+
+name$font_name <-  gsub(
+  pattern ="<span style='color:#566969ff'><i>Bacteria</i>_F136",
+  replacement = "<span style='color:#566969ff'>Bacteria_Unclassified_F136",
+  x = name$font_name,
+  fixed = TRUE)
+
+name$font_name <-  gsub(
+  pattern ="<span style='color:#696969ff'><i>Eubacteriales</i>_F45",
+  replacement = "<span style='color:#696969ff'>Eubacteriales_Unclassified_F45",
+  x = name$font_name,
+  fixed = TRUE)
+
+# add to fig data and check name
+df$font_name <- name$font_name
+name <- name %>% 
+  unite("Species",c(V1,V2),sep = "_F")
+identical(name$Species, df$Species)   # MUST output TRUE
+
+### make legend name for family -----------------
+name <- df %>% 
+  select(Family) %>%
+  mutate(
+    font_name = case_when(
+      grepl("Unclassified", Family) ~ glue("{Family}"),
+      TRUE ~ glue("<i>{Family}</i>")
+    )
+
+
+
+## For ASVs--------------------
+set.seed(123)
+output <- ancombc2(data=phy_ail,
+                  fix_formula = "Treatment",group = "Treatment",tax_level="Species",
+                  prv_cut = 0,lib_cut = 0, alpha=0.05,p_adj_method="fdr",
+                  struc_zero = F,neg_lb = F,pseudo = 1,pseudo_sens = FALSE,
+                  global = FALSE,pairwise = TRUE,dunnet = FALSE,trend = FALSE,
+                  n_cl = 1
+)
+# export results
+# select top ASVs
+feature_table2 <- feature_table %>% 
+  mutate(across(everything(), ~./sum(.))) %>% 
+  arrange(desc(rowSums(.))) 
+feature_table2 <- feature_table2[1:50,]
+# get results
+res_prim = output$res_pair %>% 
+  select(taxon, starts_with("lfc_"), starts_with("q_")) %>% 
+  filter(taxon %in% rownames(feature_table2)) 
+
+--- codes for metagenomic data analysis (upstream) -----
+source /scratch/josh/software/miniconda3/bin/activate   #activate conda
+conda activate metagenomic       #activate environment
+
+
+#checkm2      :checkm2(v1.0.2)
+#maxbin2      :maxbin2(v2.2.7)
+#metabat2     :metabat2(v2.17)
+#concoct      :concoct(v1.1.0) 
+#metagenomic  :fastqc(v0.12.1), fastp(v0.23.4), multiqc(v1.22.3), bowtie2(v2.5.4),
+#              samtools(v1.2.0), megahit(v1.2.9), prodigal(v2.6.3), cdhit(v4.8.1), diamond(v2.1.9),
+#              fastqpair(v1.0) 
+
+# quality check FastQC 
+
+mkdir /scratch/josh/metagenomics-jing/results/fastqc_results/
+indir=/scratch/josh/metagenomics-jing/rawdata/*fq.gz
+outdir=/scratch/josh/metagenomics-jing/results/fastqc_results/
+fastqc --threads 30 --outdir ${outdir} ${indir}
+#conbine fastqc files  (v1.22.3)
+mkdir /scratch/josh/metagenomics-jing/results/fastqc_results/multiqc/
+outdir_mqc=/scratch/josh/metagenomics-jing/results/fastqc_results/multiqc/
+multiqc ${outdir} --outdir ${outdir_mqc}
+
+
+#read long: 50 bp 
+
+# quality check again
+#quality check FastQC (v0.12.1)
+mkdir /scratch/josh/metagenomics-jing/results/fastqc_results_trim4/
+indir=/scratch/josh/metagenomics-jing/results/trim_data4/*fq.gz
+outdir=/scratch/josh/metagenomics-jing/results/fastqc_results_trim4/
+fastqc --threads 30 --outdir ${outdir} ${indir}
+#conbine fastqc files  (v1.22.3)
+mkdir /scratch/josh/metagenomics-jing/results/fastqc_results_trim4/multiqc/
+outdir_mqc=/scratch/josh/metagenomics-jing/results/fastqc_results_trim4/multiqc/
+multiqc ${outdir} --outdir ${outdir_mqc}
+
+
+# remove host genome bowtie2 (v2.5.4)  
+#index genome using bowtie2  #2h
+db_dir=/scratch/josh/metagenomic_hf_db/
+host_fna=chicken.fna,maize.fna,soybean.fna
+cd ${db_dir}
+bowtie2-build ${host_fna} chick_food --threads 10
+
+#remove host gene  #33.5h
+mkdir /scratch/josh/metagenomics-jing/results/align_sam
+mkdir /scratch/josh/metagenomics-jing/results/mvhost_data
+db_index=/scratch/josh/metagenomic_hf_db/chick_food
+data_dir=/scratch/josh/metagenomics-jing/results/trim_data4/
+samout=/scratch/josh/metagenomics-jing/results/align_sam/
+otudir=/scratch/josh/metagenomics-jing/results/mvhost_data/
+cd ${data_dir}
+for i in *_1.clean.fq.gz;
+do 
+    i=${i/_1.clean.fq.gz/}
+    bowtie2 -x ${db_index} \
+         -1 ${i}_1.clean.fq.gz \
+         -2 ${i}_2.clean.fq.gz \
+         -S ${samout}${i}.sam \
+         --un-conc-gz ${otudir}${i} \
+         --seed 07092024 \
+         --threads 30 \
+         --fr
+done
+
+grep "overall alignment rate" remove_host.txt | wc 
+
+#modify file name
+data_dir=/scratch/josh/metagenomics-jing/results/mvhost_data/
+cd ${data_dir}
+for i in *; 
+do  
+    if [[ "$i" == *".1" ]]; then
+        cp ${i} ${i/.1/_1.fq.gz}
+    elif [[ "$i" == *".2" ]]; then
+        cp ${i} ${i/.2/_2.fq.gz}
+    fi
+done
+
+
+# assemble
+#Megahit (v1.2.9)
+# k-min 21  k-max 141  k-step 12  [default]
+# min-contig-len 200 [default]
+# min-contig-len 500
+
+#individual assemble  #30h
+mkdir -p /scratch/josh/metagenomics-jing/results/assemble/megahit_individual/
+data_dir=/scratch/josh/metagenomics-jing/results/mvhost_data/
+outdir=/scratch/josh/metagenomics-jing/results/assemble/megahit_individual/
+cd ${data_dir}
+#loop run
+for i in *_1.fq.gz;
+do 
+    i=${i/_1.fq.gz/}
+    megahit \
+        -1 ${i}_1.fq.gz \
+        -2 ${i}_2.fq.gz \
+        --k-min 21 \
+        --k-max 141 \
+        --k-step 12 \
+        --min-contig-len 500 \
+        --out-dir ${outdir}${i} \
+        --out-prefix megahit_${i} \
+        -t 30
+done
+#move individual assemble contigs to one folder
+cd ${outdir}
+for i in */;
+do
+    cd ${i}
+    mv *.fa ../
+    cd ..
+done
+
+
+#parallel run  #24h
+mkdir -p /scratch/josh/metagenomics-jing/results/assemble/try/
+data_dir=/scratch/josh/metagenomics-jing/results/mvhost_data/
+cd ${data_dir}
+ls *_1.fq.gz | parallel --jobs 2 -k '
+    i={}
+    i=${i/_1.fq.gz/}
+    outdir=/scratch/josh/metagenomics-jing/results/assemble/try/
+    megahit \
+        -1 ${i}_1.fq.gz \
+        -2 ${i}_2.fq.gz \
+        --k-min 21 \
+        --k-max 141 \
+        --k-step 12 \
+        --min-contig-len 500 \
+        --out-dir ${outdir}${i} \
+        --out-prefix megahit_${i} \
+        -m 0.4 \
+        -t 15
+'
+
+#co-assemble   #16.5h
+indir=/scratch/josh/metagenomics-jing/results/mvhost_data/
+outdir=/scratch/josh/metagenomics-jing/results/assemble/megahit_co/
+cd ${indir}
+R1=$(ls *_1* | tr "\n" "," | sed 's/,$//')
+R2=$(ls *_2* | tr "\n" "," | sed 's/,$//')
+megahit \
+        -1 ${R1} \
+        -2 ${R2} \
+        --k-min 21 \
+        --k-max 141 \
+        --k-step 12 \
+        --min-contig-len 500 \
+        --out-dir ${outdir} \
+        --out-prefix megahit_co \
+        -t 30
+
+
+# Gene pridiction
+#Prodigal (v2.6.3)
+# -d nucleotide sequences   -a protein translations  -s start/stop pairs along with score information
+
+#co-assemble pridict    #80min
+mkdir -p /scratch/josh/metagenomics-jing/results/prodigal/prodigal_co/
+input=/scratch/josh/metagenomics-jing/results/assemble/megahit_co/megahit_co.contigs.fa
+outdir=/scratch/josh/metagenomics-jing/results/prodigal/prodigal_co/
+prodigal \
+        -p meta \
+        -i ${input} \
+        -f gff \
+        -o ${outdir}co.gff \
+        -a ${outdir}co_protein_file.faa\
+        -d ${outdir}co_mrna_file.fasta
+
+#individual-assemble pridict
+#loop run   #15.2h
+mkdir -p /scratch/josh/metagenomics-jing/results/prodigal/prodigal_in/
+indir=/scratch/josh/metagenomics-jing/results/assemble/megahit_individual/
+outdir=/scratch/josh/metagenomics-jing/results/prodigal/prodigal_in/
+cd ${indir}
+for i in *fa;
+do
+    name=${i/megahit_/}
+    name=${name/.contigs.fa/}
+    prodigal \
+        -p meta \
+        -i ${i} \
+        -f gff \
+        -o ${outdir}in_${name}.gff \
+        -a ${outdir}in_${name}_protein_file.faa\
+        -d ${outdir}in_${name}_mrna_file.fasta
+done
+
+#parallel run  #49min
+mkdir -p /scratch/josh/metagenomics-jing/results/prodigal/try2/
+indir=/scratch/josh/metagenomics-jing/results/assemble/megahit_individual/
+cd ${indir}
+ls *fa | parallel --jobs 30 -k '
+    i={}
+    name=${i/megahit_/}
+    name=${name/.contigs.fa/}
+    outdir=/scratch/josh/metagenomics-jing/results/prodigal/try2/
+    prodigal \
+        -p meta \
+        -i ${i} \
+        -f gff \
+        -o ${outdir}in_${name}.gff \
+        -a ${outdir}in_${name}_protein_file.faa \
+        -d ${outdir}in_${name}_mrna_file.fasta
+'
+
+# before de-redundancy
+# combine all files together
+# for mRNA
+mkdir /scratch/josh/metagenomics-jing/results/cdhit/
+codir=/scratch/josh/metagenomics-jing/results/prodigal/prodigal_co/
+indir=/scratch/josh/metagenomics-jing/results/prodigal/try/
+workdir=/scratch/josh/metagenomics-jing/results/cdhit/
+workdir=/scratch/josh/metagenomics-jing/compar/
+cp ${codir}*fasta ${workdir}
+parallel --j 30 --bar cp {} distdir ::: ${workdir}/*
+
+parallel --j 30 -k --bar cp -a ${indir}*fasta ::: ${workdir}
+# for protein
+cp ${codir}*faa ${workdir}
+parallel --j 30 -k --bar cp -a ${indir}*faa ::: ${workdir}
+
+#delete /n
+#for mRNA
+workdir=/scratch/josh/metagenomics-jing/results/cdhit/
+cd ${workdir}
+ls *_mrna_file.fasta | parallel --jobs 30 -k --bar '
+    i={}
+    name=${i/_mrna_file.fasta/}
+    awk '"'"'
+        BEGIN { RS=">"; FS="\n"; ORS="" } 
+        NR > 1 { print ">" $1; print "\n";
+            for (j=2; j<=NF; j++) print $j; print "\n" 
+        }
+    '"'"' ${i} > ${name}_remove.fasta
+'
+# for protein
+ls *_protein_file.faa | parallel --jobs 30 -k --bar '
+    i={}
+    name=${i/_protein_file.faa/}
+    awk '"'"'
+        BEGIN { RS=">"; FS="\n"; ORS="" } 
+        NR > 1 { print ">" $1; print "\n";
+            for (j=2; j<=NF; j++) print $j; print "\n" 
+        }
+    '"'"' ${i} > ${name}_remove.faa
+'
+
+rm *rna* *protein* #delete orginal files
+
+#filter mRNA less than 100bp
+workdir=/scratch/josh/metagenomics-jing/results/cdhit/
+cd "${workdir}"
+ls *_remove.fasta | parallel --jobs 30 -k --bar '
+    i={}
+    name=${i/_remove.fasta/_filtered.fasta}
+    awk '"'"'{
+        if (NR % 2 == 1) {
+            line1 = $0
+        } else {
+            if (length($0) >= 100) {
+                print line1
+                print $0
+            }
+        }
+    }'"'"' ${i} > ${name}
+'
+#modify protein file according to mRNA file
+ls *_filtered.fasta | parallel --jobs 30 -k --bar '
+    gene_file={}
+    protein_file=${gene_file/_filtered.fasta/_remove.faa}
+    out_file=${gene_file/_filtered.fasta/_filtered.faa}
+    awk '"'"'
+        FNR==NR {
+            if ($0 ~ /^>/) {
+            names[$0] = 1
+            }
+            next
+        }
+        {if ($0 in names) {
+            print $0
+            getline
+            print $0
+            }
+        }
+    '"'"' ${gene_file} ${protein_file} > ${out_file}
+'
+rm *remove*  #delete unneeded
+
+#add sample name to seqs names to avoid duplicate gene names
+# for mRNA 
+workdir=/scratch/josh/metagenomics-jing/results/cdhit/
+cd ${workdir}
+ls *_filtered.fasta | parallel --jobs 30 -k --bar '
+    i={}
+    name=${i/_filtered.fasta/}
+    sed -i "s/>/>${name}_/" ${i}
+'
+# for protein
+ls *_filtered.faa | parallel --jobs 30 -k --bar '
+    i={}
+    name=${i/_filtered.faa/}
+    sed -i "s/>/>${name}_/" ${i}
+'
+
+#combine all files together
+cat *.fasta > prodigal_all.fasta
+cat *.faa > prodigal_all.faa
+#rm *filter* 
+
+# de-redundancy
+#CD-Hit (v4.8.1)  #2.5h
+#-c	sequence identity threshold [default 0.9]  -G 1:global sequence identity, 0:local sequence identity
+#-M memory limit  -T number of threads  -n word_length
+#-aS alignment coverage for the shorter sequence
+#-g 1 more accurate
+workdir=/scratch/josh/metagenomics-jing/results/cdhit/
+workdir=/scratch/josh/metagenomics-jing/compar/
+cd ${workdir}
+
+cd-hit-est \
+    -i prodigal_all.fasta \
+    -o rep_all_mRNA.fasta \
+    -c 0.95 \
+    -g 1 \
+    -G 0 \
+    -M 0  \
+    -T 0  \
+    -aS 0.9
+
+#get de-redundent protein
+awk '
+    FNR==NR {
+        if ($0 ~ /^>/) {
+        names[$0] = 1
+        }
+         next
+    }
+    {if ($0 in names) {
+        print $0
+        getline
+        print $0
+        }
+    }
+    ' rep_mRNA.fasta prodigal_all.faa > rep_protein.faa
+
+#diamond (v2.1.9)
+
+#binning
+#filter contigs < 1500 bp
+mkdir -p /scratch/josh/metagenomics-jing/results/bin/contigs/
+#for co-assemle contigs
+workdir=/scratch/josh/metagenomics-jing/results/assemble/megahit_co/
+file=megahit_co.contigs.fa
+outfile=/scratch/josh/metagenomics-jing/results/bin/contigs/co_filter.fa
+cd ${workdir}
+awk '{
+        if (NR % 2 == 1) {
+            line1 = $0
+        } else {
+            if (length($0) >= 1500) {
+                print line1
+                print $0
+            }
+        }
+    }' ${file} > ${outfile}
+
+
+#loop #5.6h
+mkdir -p /scratch/josh/metagenomics-jing/results/bin/metabat2/coverage/samout2
+data_dir=/scratch/josh/metagenomics-jing/results/trim_data4/
+db_index=/scratch/josh/metagenomics-jing/results/bin/metabat2/coverage/co_filter
+samout=/scratch/josh/metagenomics-jing/results/bin/metabat2/coverage/samout2/
+cd ${data_dir}
+for i in *_1.clean.fq.gz;
+do 
+    i=${i/_1.clean.fq.gz/}
+    bowtie2 -x ${db_index} \
+         -1 ${i}_1.clean.fq.gz \
+         -2 ${i}_2.clean.fq.gz \
+         -S ${samout}${i}.sam \
+         --seed 07212024 \
+         --threads 30 \
+         --fr
+done
+
+#sam to bam  #74min
+workdir=/scratch/josh/metagenomics-jing/results/bin/metabat2/coverage/samout2/
+cd ${workdir}
+ls *sam | parallel --jobs 2 -k '
+    i={}
+    name=${i/.sam/.bam}
+    samtools sort ${i} \
+        -@ 15 \
+        -o ${name}
+'
+
+
+#using metabat2
+source /scratch/josh/software/miniconda3/bin/activate   #activate conda
+conda activate metabat2      
+
+#TNF (tetra-nucleotide frequency) binning  #30sample 6min
+mkdir -p /scratch/josh/metagenomics-jing/results/bin/metabat2/bin_results/
+datadir=/scratch/josh/metagenomics-jing/results/bin/contigs/
+cd ${datadir}
+ls *fa | parallel --jobs 2 -k '
+    i={}
+    name=${i/_filter.fa/}
+    basename=metabat_${name}
+    outdir=/scratch/josh/metagenomics-jing/results/bin/metabat2/bin_results/
+    metabat2 \
+        -i ${i} \
+        -o ${outdir}${basename} \
+        -t 15 \
+        --seed  072124
+'
+
+#TNF (tetra-nucleotide frequency) and ABD (abundance) binning  #4min
+outdir=/scratch/josh/metagenomics-jing/results/bin/metabat2/bin_results/
+contigs_file=/scratch/josh/metagenomics-jing/results/bin/contigs/co_filter.fa
+bam_dir=/scratch/josh/metagenomics-jing/results/bin/metabat2/coverage/samout2/
+cd ${bam_dir}
+jgi_summarize_bam_contig_depths --outputDepth depth.txt *.bam
+metabat2 \
+    -i ${contigs_file} \
+    -a depth.txt \
+    -o ${outdir}metabat_both \
+    -t 30 \
+    --seed  072124
+
+--- python code for Nanopore data analysis (just show a part) --------
+#!/usr/bin/env python3
+import gzip
+import sys
+
+fasta_file = sys.argv[1]
+acc2taxid_file = sys.argv[2]
+output_file = sys.argv[3]
+
+# Step 1: read header in FASTA
+accessions = []
+with open(fasta_file, "r") as f:
+    for line in f:
+        if line.startswith(">"):
+            # get accession 
+            acc = line[1:].strip().split()[0]
+            accessions.append(acc)
+
+accessions = set(accessions)  # dereplication
+
+# Step 2: read NCBI accession2taxid.gz create dictionary
+acc2tax = {}
+with gzip.open(acc2taxid_file, "rt") as f:
+    next(f)  # skip header
+    for line in f:
+        cols = line.strip().split("\t")
+        acc = cols[1]
+        taxid = cols[2]
+        if acc in accessions:
+            acc2tax[acc] = taxid
+
+# Step 3: output seq2tax.map.tsv
+with open(output_file, "w") as out:
+    for acc in accessions:
+        if acc in acc2tax:
+            out.write(f"{acc}\t{acc2tax[acc]}\n")
+        else:
+            sys.stderr.write(f"WARNING: {acc} not found in accession2taxid\n")
+
+
+python3 build_seq2tax.py bacteria.16SrRNA.fna nucl_gb.accession2taxid.gz seq2tax.map.tsv
+awk 'BEGIN{OFS="\t"; print "id","lineage"} 
+{
+    split($0, arr, "\t")
+    id = arr[1]
+    n = split(arr[2], tax, ";")
+    lineage = ""
+    for (i=n; i>=1; i--) {
+        gsub(/^ +| +$/, "", tax[i]) 
+        if (lineage=="") {
+            lineage = tax[i]
+        } else {
+            lineage = lineage ";" tax[i]
+        }
+    }
+    print id, lineage
+}' 666.txt > taxonomy.tsv
+
+awk 'NR==FNR{map[$1]=$2; next} 
+    FNR==1{print $0; next} 
+    ($1 in map){$1=map[$1]} 
+    {print $0}' seq2tax.map.tsv taxonomy.tsv > updated.tax.tsv
+
+
+# -*- coding: utf-8 -*-
+import csv
+
+# Input files
+map_file = "merged.dmp"           # First file (old_id -> new_id)
+seq_file = "seq2tax.map.tsv"      # Second file
+out_file = "seq2tax.map.replaced.tsv"  # Output file
+
+# 1. Read mapping (old_id -> new_id)
+id_map = {}
+with open(map_file, "r", encoding="utf-8") as f:
+     for line in f:
+        # Remove leading/trailing whitespace
+        line = line.strip()
+        # Split by '|', strip whitespace from each part
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) >= 2:
+            old_id = parts[0]
+            new_id = parts[1]
+            id_map[old_id] = new_id
+
+print(f"Loaded {len(id_map)} mapping entries")
